@@ -265,9 +265,10 @@ manifest already grants stronger permissions for the latter two. Keep the job pa
 until the new revision serves traffic.
 
 For the `ai-ecoverse-493315` manager, stage a candidate image with
-`gcloud run deploy github-runners-manager-uc1 --image IMAGE --region us-central1 --project ai-ecoverse-493315 --no-traffic --tag reconcile`. Confirm that traffic
-still points to `github-runners-manager-uc1-00004-x9b`, then enable the scheduler
-job only after switching traffic and checking a queued-job starvation test. The
+`gcloud run deploy github-runners-manager-uc1 --image IMAGE --region us-central1 --project ai-ecoverse-493315 --no-traffic --tag TAG`.
+Confirm that the traffic allocation and Scheduler state are unchanged by staging.
+For an initial rollout, enable the scheduler only after switching traffic and checking
+a queued-job starvation test. The
 previous image is `app@sha256:2d4c1b05da5f4067ab0ae0bddcbe4a85522de2851d99af41eb8746daccec73de`.
 To roll back, pause `github-runners-reconcile` first, then send 100% traffic to
 revision `github-runners-manager-uc1-00004-x9b`:
@@ -282,7 +283,8 @@ gcloud run services update-traffic github-runners-manager-uc1 \
 If the scheduler account, IAM binding, and job were initially created with
 `gcloud` rather than Terraform, import those resources into the existing
 Terraform state before applying this configuration. Keep `paused = true` until
-the traffic switch and live test are complete.
+the initial traffic switch and live test are complete; do not apply this initial
+state over a scheduler that has already been enabled without reviewing the diff.
 
 ## Rebuild Google Compute Engine Custom Images
 

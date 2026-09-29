@@ -237,6 +237,16 @@ they also appear as `queued`. The reconciler can provision these early, and the 
 reaper later retires unused VMs. For benchmark workflows, set `shards ≤ max-parallel`
 to avoid this idle capacity cycle.
 
+The GitHub API can change a paginated result while a tick reads it. The manager
+retries an incomplete read twice, then fails the tick so the next scheduled tick
+can try again. Failure logs include only the HTTP status, endpoint path, and a
+fixed reason; they never include GitHub response bodies or credentials. Each tick
+also logs phase timings for GitHub authentication, repository and job reads, GCE
+listing, and runner inventory. Job reads use at most six concurrent requests per
+repository. A second tick in the same Cloud Run process is skipped while the first
+is running; the scheduler normally serializes invocations, but this local guard
+does not coordinate separate Cloud Run instances.
+
 ## 🔐 Environment Variables
 
 | Variable                  | Description                    | Required                                   |

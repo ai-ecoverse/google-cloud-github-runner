@@ -6,6 +6,7 @@ from flask import Blueprint, jsonify, request
 from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2 import id_token
 
+from app.clients.github_client import GitHubReadError
 from app.services.reconcile_service import ReconcileService
 
 logger = logging.getLogger(__name__)
@@ -34,5 +35,9 @@ def reconcile():
     try:
         return jsonify(ReconcileService().run()), 200
     except Exception as error:
-        logger.error('Reconciliation failed: %s', type(error).__name__)
+        if isinstance(error, GitHubReadError):
+            logger.error('Reconciliation failed: %s status=%s endpoint=%s reason=%s',
+                         type(error).__name__, error.status_code, error.endpoint_path, error.reason)
+        else:
+            logger.error('Reconciliation failed: %s', type(error).__name__)
         return jsonify({'status': 'error'}), 500

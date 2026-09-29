@@ -6,11 +6,22 @@ import time
 import jwt
 import requests
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote
 
 REQUEST_TIMEOUT = 30  # seconds
 
 logger = logging.getLogger(__name__)
+
+
+class GitHubReadError(RuntimeError):
+    """Safe context for a failed GitHub read; never includes credentials or response bodies."""
+
+    def __init__(self, path, status_code, reason):
+        self.endpoint_path = path
+        self.status_code = status_code
+        self.reason = reason
+        super().__init__(f'GitHub read {reason}: status={status_code}, path={path}')
 
 
 class GitHubClient:
@@ -113,7 +124,16 @@ class GitHubClient:
         return response.json()['token']
 
     def _list_pages(self, path, key, token, params=None):
-        """Read every page; fail closed if GitHub truncates a large result set."""
+        """Read every page; retry a changing result set before failing closed."""
+        for attempt in range(3):
+            try:
+                return self._list_pages_once(path, key, token, params)
+            except GitHubReadError as error:
+                if error.reason != 'incomplete_pagination' or attempt == 2:
+                    raise
+                time.sleep(0.25 * (attempt + 1))
+
+    def _list_pages_once(self, path, key, token, params):
         headers = {
             'Authorization': f'Bearer {token}',
             'Accept': 'application/vnd.github+json',
@@ -123,15 +143,19 @@ class GitHubClient:
         page = 1
         while True:
             query = dict(params or {}, per_page=100, page=page)
-            response = requests.get(f'https://api.github.com{path}', headers=headers,
-                                    params=query, timeout=REQUEST_TIMEOUT)
-            response.raise_for_status()
+            try:
+                response = requests.get(f'https://api.github.com{path}', headers=headers,
+                                        params=query, timeout=REQUEST_TIMEOUT)
+                response.raise_for_status()
+            except requests.RequestException as error:
+                status = getattr(getattr(error, 'response', None), 'status_code', None)
+                raise GitHubReadError(path, status, 'http_error') from error
             body = response.json()
             batch = body[key] if key else body
             items.extend(batch)
             if len(batch) < 100:
                 if body.get('total_count', len(items)) > len(items):
-                    raise RuntimeError(f'Incomplete GitHub pagination for {path}')
+                    raise GitHubReadError(path, response.status_code, 'incomplete_pagination')
                 return items
             page += 1
 
@@ -142,11 +166,19 @@ class GitHubClient:
         """Inspect jobs in every active workflow run, including runs at max-parallel."""
         repo = quote(repo_name, safe='/')
         jobs = {}
-        for status in ('queued', 'in_progress', 'waiting', 'pending', 'requested'):
-            runs = self._list_pages(f'/repos/{repo}/actions/runs', 'workflow_runs', token,
-                                    {'status': status})
-            for run in runs:
-                for job in self._list_pages(f"/repos/{repo}/actions/runs/{run['id']}/jobs", 'jobs', token):
+        statuses = ('queued', 'in_progress', 'waiting', 'pending', 'requested')
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            runs_by_status = executor.map(
+                lambda status: self._list_pages(f'/repos/{repo}/actions/runs', 'workflow_runs', token,
+                                                {'status': status}), statuses,
+            )
+            run_ids = list(dict.fromkeys(run['id'] for runs in runs_by_status for run in runs))
+            job_pages = executor.map(
+                lambda run_id: self._list_pages(f'/repos/{repo}/actions/runs/{run_id}/jobs', 'jobs', token),
+                run_ids,
+            )
+            for run_jobs in job_pages:
+                for job in run_jobs:
                     if job.get('status') == 'queued':
                         jobs[job['id']] = job
         return list(jobs.values())

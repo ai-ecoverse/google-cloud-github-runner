@@ -1,9 +1,13 @@
 """Reconciler decisions use mocked GitHub and Compute Engine clients only."""
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from app.services.reconcile_service import ReconcileService, RepoScanCache
+import pytest
+
+from app.clients.github_client import GitHubReadError
+from app.services.reconcile_service import ReconcileService, RepoScanCache, reconcile_lock
 
 NOW = datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
 REPO = {
@@ -199,3 +203,40 @@ def test_warm_tick_scans_vm_owner_even_without_cached_job():
     assert svc.run()['scanned_repos'] == 1
     github.list_queued_workflow_jobs.assert_called_once_with('example/project', 'mock-token')
     gcloud.delete_runner_instance.assert_not_called()
+
+
+def test_overlapping_tick_skips_without_reading_or_mutating():
+    svc, github, gcloud, webhook = service(jobs=[job(4, 1)])
+    reconcile_lock.acquire()
+    try:
+        result = svc.run()
+    finally:
+        reconcile_lock.release()
+
+    assert result['skipped'] == 'already_running'
+    github.get_installation_access_token.assert_not_called()
+    gcloud.list_runner_instances.assert_not_called()
+    webhook._handle_queued_job.assert_not_called()
+
+
+def test_failed_warm_scan_logs_safe_github_context_and_releases_lock(capsys):
+    cache = RepoScanCache()
+    cache.last_full_scan = NOW - timedelta(minutes=2)
+    cache.hot_repos['example/project'] = NOW
+    svc, github, _, _ = service()
+    svc.cache = cache
+    github.list_queued_workflow_jobs.side_effect = GitHubReadError(
+        '/repos/example/project/actions/runs', 200, 'incomplete_pagination',
+    )
+
+    with pytest.raises(GitHubReadError):
+        svc.run()
+
+    result = json.loads(capsys.readouterr().out.strip())
+    assert result['full_scan'] is False
+    assert result['scanned_repos'] == 1
+    assert result['error_status'] == 200
+    assert result['error_endpoint'] == '/repos/example/project/actions/runs'
+    assert 'github_jobs' in result['timing_ms']
+    assert 'secret' not in str(result)
+    assert reconcile_lock.locked() is False

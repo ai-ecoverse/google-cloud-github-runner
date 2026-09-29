@@ -1,8 +1,10 @@
 """Periodic reconciliation of queued GitHub jobs and available GCE runners."""
 import json
 import os
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
+from threading import Lock
 
 from app.clients import GCloudClient, GitHubClient
 from app.services.webhook_service import WebhookService
@@ -64,6 +66,7 @@ class RepoScanCache:
 
 
 repo_scan_cache = RepoScanCache()
+reconcile_lock = Lock()
 
 
 class ReconcileService:
@@ -149,12 +152,23 @@ class ReconcileService:
         return supply, covered
 
     def run(self):
-        summary = {'event': 'reconcile', 'labels': {}, 'capacity_stop': False}
+        started = time.monotonic()
+        summary = {'event': 'reconcile', 'labels': {}, 'capacity_stop': False, 'timing_ms': {}}
+        if not reconcile_lock.acquire(blocking=False):
+            summary['skipped'] = 'already_running'
+            print(json.dumps(summary, sort_keys=True), flush=True)
+            return summary
         try:
+            phase = time.monotonic()
             token = self.github.get_installation_access_token()
+            summary['timing_ms']['github_auth'] = round((time.monotonic() - phase) * 1000)
+            phase = time.monotonic()
             repos = self.github.list_installation_repositories(token)
+            summary['timing_ms']['github_repos'] = round((time.monotonic() - phase) * 1000)
             scopes = {scope_for_repo(repo) for repo in repos}
+            phase = time.monotonic()
             vms = self.gcloud.list_runner_instances()
+            summary['timing_ms']['gce_instances'] = round((time.monotonic() - phase) * 1000)
             scan_repos, full_scan = self.cache.select(
                 repos, vms, self.now, self.full_scan_interval, self.hot_repo_interval,
             )
@@ -162,21 +176,27 @@ class ReconcileService:
             summary['full_scan'] = full_scan
             demand = defaultdict(list)
             queued_ids = set()
-            for repo in scan_repos:
-                scope = scope_for_repo(repo)
-                jobs = self.github.list_queued_workflow_jobs(repo['full_name'], token)
-                self.cache.observe(repo['full_name'], jobs, self.now)
-                for job in jobs:
-                    queued_ids.add(str(job['id']))
-                    age = (self.now - parse_time(job['created_at'])).total_seconds()
-                    if age < self.job_grace:
-                        continue
-                    label = next((label for label in job.get('labels', []) if label.startswith('gcp-')), None)
-                    if label:
-                        demand[(scope, label)].append((job['created_at'], repo, str(job['id'])))
+            phase = time.monotonic()
+            try:
+                for repo in scan_repos:
+                    scope = scope_for_repo(repo)
+                    jobs = self.github.list_queued_workflow_jobs(repo['full_name'], token)
+                    self.cache.observe(repo['full_name'], jobs, self.now)
+                    for job in jobs:
+                        queued_ids.add(str(job['id']))
+                        age = (self.now - parse_time(job['created_at'])).total_seconds()
+                        if age < self.job_grace:
+                            continue
+                        label = next((label for label in job.get('labels', []) if label.startswith('gcp-')), None)
+                        if label:
+                            demand[(scope, label)].append((job['created_at'], repo, str(job['id'])))
+            finally:
+                summary['timing_ms']['github_jobs'] = round((time.monotonic() - phase) * 1000)
             self.cache.complete(self.now, full_scan)
 
+            phase = time.monotonic()
             supply, covered = self._inventory(scopes, token, summary, vms)
+            summary['timing_ms']['inventory'] = round((time.monotonic() - phase) * 1000)
             for key, count in supply.items():
                 scope, label = key
                 summary['labels'][f'{scope[0]}:{scope[1]}/{label}']['supply'] = count
@@ -212,6 +232,12 @@ class ReconcileService:
             return summary
         except Exception as error:
             summary['error'] = type(error).__name__
+            if hasattr(error, 'endpoint_path'):
+                summary['error_status'] = error.status_code
+                summary['error_endpoint'] = error.endpoint_path
+                summary['error_reason'] = error.reason
             raise
         finally:
+            summary['timing_ms']['total'] = round((time.monotonic() - started) * 1000)
+            reconcile_lock.release()
             print(json.dumps(summary, sort_keys=True), flush=True)
