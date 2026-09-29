@@ -32,17 +32,55 @@ def label_entry(summary, scope, label):
     return summary['labels'].setdefault(key, {'demand': 0, 'supply': 0, 'created': 0, 'deleted': 0})
 
 
+class RepoScanCache:
+    """Keep recently active repos warm; rescan the full installation periodically."""
+
+    def __init__(self):
+        self.last_full_scan = None
+        self.hot_repos = {}
+
+    def select(self, repos, vms, now, full_interval, hot_interval):
+        full = (self.last_full_scan is None
+                or (now - self.last_full_scan).total_seconds() >= full_interval)
+        vm_repos = {
+            f"{vm.labels['gha-owner']}/{vm.labels['gha-repo']}".lower()
+            for vm in vms if vm.name.startswith('gcp-runner-')
+            and vm.labels and vm.labels.get('gha-owner') and vm.labels.get('gha-repo')
+        }
+        self.hot_repos = {name: seen for name, seen in self.hot_repos.items()
+                          if (now - seen).total_seconds() < hot_interval}
+        if full:
+            return repos, True
+        return [repo for repo in repos if repo['full_name'].lower() in vm_repos
+                or repo['full_name'].lower() in self.hot_repos], False
+
+    def observe(self, repo_name, jobs, now):
+        if any(any(label.startswith('gcp-') for label in job.get('labels', [])) for job in jobs):
+            self.hot_repos[repo_name.lower()] = now
+
+    def complete(self, now, full):
+        if full:
+            self.last_full_scan = now
+
+
+repo_scan_cache = RepoScanCache()
+
+
 class ReconcileService:
     """Top up missing capacity and retire runners that are safely idle."""
 
-    def __init__(self, github=None, gcloud=None, webhook=None, now=None):
+    def __init__(self, github=None, gcloud=None, webhook=None, now=None, cache=None):
         self.github = github or GitHubClient()
         self.gcloud = gcloud or GCloudClient()
         self.webhook = webhook or WebhookService()
         self.now = now or datetime.now(timezone.utc)
+        self.cache = cache if cache is not None else repo_scan_cache
         self.job_grace = int(os.environ.get('RECONCILE_JOB_GRACE_SECONDS', '120'))
         self.idle_limit = int(os.environ.get('RECONCILE_IDLE_SECONDS', '1200'))
         self.registration_limit = int(os.environ.get('RECONCILE_REGISTRATION_SECONDS', '900'))
+        self.assignment_grace = int(os.environ.get('RECONCILE_ASSIGNMENT_GRACE_SECONDS', '300'))
+        self.full_scan_interval = int(os.environ.get('RECONCILE_FULL_SCAN_SECONDS', '1800'))
+        self.hot_repo_interval = int(os.environ.get('RECONCILE_HOT_REPO_SECONDS', '21600'))
 
     def _vm_scope(self, vm, scopes):
         labels = vm.labels or {}
@@ -65,41 +103,50 @@ class ReconcileService:
         return (was_registered and runner.get('status') == 'online'
                 and runner.get('busy') is False)
 
-    def _inventory(self, scopes, token, summary):
-        runners = {scope: {runner['name']: runner for runner in self.github.list_runners(scope, token)}
-                   for scope in scopes}
+    def _inventory(self, scopes, token, summary, vms):
+        runners = {}
         supply = defaultdict(int)
+        covered = {}
         now_epoch = int(self.now.timestamp())
-        for vm in self.gcloud.list_runner_instances():
+        for vm in vms:
             scope = self._vm_scope(vm, scopes)
             label = (vm.labels or {}).get('gha-runner')
             if not scope or not label:
                 continue
             key = (scope, label)
             entry = label_entry(summary, scope, label)
+            if scope not in runners:
+                runners[scope] = {item['name']: item for item in self.github.list_runners(scope, token)}
             runner = runners[scope].get(vm.name)
+            job_id = (vm.labels or {}).get('gha-job')
+            age = (self.now - parse_time(vm.creation_timestamp)).total_seconds()
+            recent_job = (job_id and age < self.assignment_grace)
             idle_since = (vm.labels or {}).get('gha-idle-since')
+            counted = False
             if runner:
                 if runner.get('busy') is not False or runner.get('status') != 'online':
                     if idle_since:
                         self.gcloud.set_runner_idle_since(vm, None)
+                    if recent_job:
+                        covered[(scope, label, str(job_id))] = 0
                     continue
                 if not idle_since:
                     self.gcloud.set_runner_idle_since(vm, now_epoch)
-                    supply[key] += 1
-                    continue
-                if now_epoch - int(idle_since) < self.idle_limit:
-                    supply[key] += 1
-                    continue
+                    counted = True
+                elif now_epoch - int(idle_since) < self.idle_limit:
+                    counted = True
             else:
-                age = (self.now - parse_time(vm.creation_timestamp)).total_seconds()
                 if age < self.registration_limit:
-                    supply[key] += 1
-                    continue
+                    counted = True
+            if counted:
+                supply[key] += 1
+                if recent_job:
+                    covered[(scope, label, str(job_id))] = 1
+                continue
             if self._can_delete(scope, vm.name, token, runner is not None):
                 self.gcloud.delete_runner_instance(vm.name, delivery_id='reconcile')
                 entry['deleted'] += 1
-        return supply
+        return supply, covered
 
     def run(self):
         summary = {'event': 'reconcile', 'labels': {}, 'capacity_stop': False}
@@ -107,33 +154,51 @@ class ReconcileService:
             token = self.github.get_installation_access_token()
             repos = self.github.list_installation_repositories(token)
             scopes = {scope_for_repo(repo) for repo in repos}
+            vms = self.gcloud.list_runner_instances()
+            scan_repos, full_scan = self.cache.select(
+                repos, vms, self.now, self.full_scan_interval, self.hot_repo_interval,
+            )
+            summary['scanned_repos'] = len(scan_repos)
+            summary['full_scan'] = full_scan
             demand = defaultdict(list)
-            for repo in repos:
+            queued_ids = set()
+            for repo in scan_repos:
                 scope = scope_for_repo(repo)
-                for job in self.github.list_queued_workflow_jobs(repo['full_name'], token):
+                jobs = self.github.list_queued_workflow_jobs(repo['full_name'], token)
+                self.cache.observe(repo['full_name'], jobs, self.now)
+                for job in jobs:
+                    queued_ids.add(str(job['id']))
                     age = (self.now - parse_time(job['created_at'])).total_seconds()
                     if age < self.job_grace:
                         continue
                     label = next((label for label in job.get('labels', []) if label.startswith('gcp-')), None)
                     if label:
-                        demand[(scope, label)].append((job['created_at'], repo))
+                        demand[(scope, label)].append((job['created_at'], repo, str(job['id'])))
+            self.cache.complete(self.now, full_scan)
 
-            supply = self._inventory(scopes, token, summary)
+            supply, covered = self._inventory(scopes, token, summary, vms)
             for key, count in supply.items():
                 scope, label = key
                 summary['labels'][f'{scope[0]}:{scope[1]}/{label}']['supply'] = count
             for key, jobs in sorted(demand.items()):
                 scope, label = key
                 entry = label_entry(summary, scope, label)
-                entry['demand'] = len(jobs)
-                entry['supply'] = supply[key]
-                for _, repo in sorted(jobs, key=lambda item: item[0])[supply[key]:]:
+                remaining = [item for item in jobs if (scope, label, item[2]) not in covered]
+                reserved = sum(count for (vm_scope, vm_label, job_id), count in covered.items()
+                               if vm_scope == scope and vm_label == label and job_id in queued_ids)
+                available = max(0, supply[key] - reserved)
+                entry['demand'] = len(remaining)
+                entry['supply'] = available
+                if len(remaining) != len(jobs):
+                    entry['recent_assignments'] = len(jobs) - len(remaining)
+                for _, repo, job_id in sorted(remaining, key=lambda item: item[0])[available:]:
                     owner = repo['owner']
                     try:
                         name = self.webhook._handle_queued_job(
                             label, repo['html_url'], owner['html_url'], repo['full_name'],
                             owner['login'] if scope[0] == 'org' else None,
                             delivery_id='reconcile',
+                            job_id=job_id,
                         )
                     except Exception as error:
                         if is_capacity_error(error):

@@ -62,6 +62,7 @@ class GCloudClient:
         template_name,
         instance_label=None,
         delivery_id=None,
+        job_id=None,
     ):
         """
         Create a new GCE instance for a GitHub Actions runner.
@@ -72,6 +73,7 @@ class GCloudClient:
             template_name (str): The name of the instance template to use.
             instance_label (str): Label to add to the Instance for Cost Tracking.
             delivery_id (str): The GitHub webhook delivery ID for log correlation.
+            job_id (int or None): Queued GitHub job represented by a reconciler insert.
 
         Returns:
             str: The name of the created instance.
@@ -119,6 +121,10 @@ class GCloudClient:
                 "gha-repo": repo.lower(),
                 "gha-runner": template_name
             }
+            if job_id is not None:
+                if not re.fullmatch(r'[0-9]{1,63}', str(job_id)):
+                    raise ValueError("job_id must be a GCE-safe decimal label")
+                instance_resource.labels["gha-job"] = str(job_id)
 
         # Set metadata (startup script) - use shlex.quote to prevent command injection
         runner_group_flag = ""

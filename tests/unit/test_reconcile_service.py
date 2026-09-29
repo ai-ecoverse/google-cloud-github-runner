@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from app.services.reconcile_service import ReconcileService
+from app.services.reconcile_service import ReconcileService, RepoScanCache
 
 NOW = datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
 REPO = {
@@ -17,10 +17,12 @@ def job(minutes, job_id):
             'created_at': (NOW - timedelta(minutes=minutes)).isoformat()}
 
 
-def vm(name, minutes=5, idle_since=None):
+def vm(name, minutes=5, idle_since=None, job_id=None):
     labels = {'gha-owner': 'example', 'gha-repo': 'project', 'gha-runner': 'gcp-bench-8core'}
     if idle_since is not None:
         labels['gha-idle-since'] = str(int((NOW - timedelta(minutes=idle_since)).timestamp()))
+    if job_id is not None:
+        labels['gha-job'] = str(job_id)
     return SimpleNamespace(name=name, labels=labels,
                            creation_timestamp=(NOW - timedelta(minutes=minutes)).isoformat(),
                            label_fingerprint='fingerprint')
@@ -36,7 +38,8 @@ def service(jobs=(), vms=(), runners=()):
     gcloud.list_runner_instances.return_value = list(vms)
     webhook = MagicMock()
     webhook._handle_queued_job.return_value = 'gcp-runner-new'
-    return ReconcileService(github=github, gcloud=gcloud, webhook=webhook, now=NOW), github, gcloud, webhook
+    return ReconcileService(github=github, gcloud=gcloud, webhook=webhook,
+                            now=NOW, cache=RepoScanCache()), github, gcloud, webhook
 
 
 def test_demand_supply_and_grace_period():
@@ -126,3 +129,73 @@ def test_zone_stockout_also_stops_topups():
     webhook._handle_queued_job.side_effect = RuntimeError('ZONE_RESOURCE_POOL_EXHAUSTED')
     assert svc.run()['capacity_stop'] is True
     webhook._handle_queued_job.assert_called_once()
+
+
+def test_recent_busy_assignment_covers_stale_queued_job():
+    assigned = vm('gcp-runner-assigned', minutes=2, job_id=71)
+    svc, _, _, webhook = service(
+        jobs=[job(8, 71)], vms=[assigned],
+        runners=[{'name': assigned.name, 'status': 'online', 'busy': True}],
+    )
+    result = svc.run()['labels']['org:example/gcp-bench-8core']
+    assert result['demand'] == 0
+    assert result['recent_assignments'] == 1
+    webhook._handle_queued_job.assert_not_called()
+
+
+def test_recent_provisioning_assignment_does_not_hide_other_job():
+    assigned = vm('gcp-runner-assigned', minutes=2, job_id=71)
+    svc, _, _, webhook = service(jobs=[job(8, 71), job(7, 72)], vms=[assigned])
+    result = svc.run()['labels']['org:example/gcp-bench-8core']
+    assert result['demand'] == 1
+    assert result['supply'] == 0
+    assert result['created'] == 1
+    assert webhook._handle_queued_job.call_args.kwargs['job_id'] == '72'
+
+
+def test_busy_assignment_older_than_grace_does_not_hide_stuck_job():
+    assigned = vm('gcp-runner-assigned', minutes=6, job_id=71)
+    svc, _, _, webhook = service(
+        jobs=[job(8, 71)], vms=[assigned],
+        runners=[{'name': assigned.name, 'status': 'online', 'busy': True}],
+    )
+    assert svc.run()['labels']['org:example/gcp-bench-8core']['created'] == 1
+    webhook._handle_queued_job.assert_called_once()
+
+
+def test_warm_tick_only_scans_hot_repos_and_vm_owners():
+    repos = [REPO] + [
+        {'full_name': f'example/other-{n}', 'html_url': f'https://github.com/example/other-{n}',
+         'owner': REPO['owner']} for n in range(4)
+    ]
+    cache = RepoScanCache()
+    svc, github, _, _ = service(jobs=[job(4, 71)])
+    github.list_installation_repositories.return_value = repos
+    github.list_queued_workflow_jobs.side_effect = lambda name, token: [job(4, 71)] if name == 'example/project' else []
+    svc.cache = cache
+    assert svc.run()['scanned_repos'] == 5
+    github.list_queued_workflow_jobs.reset_mock()
+
+    svc.now = NOW + timedelta(minutes=2)
+    assert svc.run()['scanned_repos'] == 1
+    assert github.list_queued_workflow_jobs.call_count == 1
+
+    svc.now = NOW + timedelta(minutes=31)
+    assert svc.run()['scanned_repos'] == 5
+
+
+def test_warm_tick_scans_vm_owner_even_without_cached_job():
+    cache = RepoScanCache()
+    cache.last_full_scan = NOW - timedelta(minutes=2)
+    repos = [REPO, {
+        'full_name': 'example/unused', 'html_url': 'https://github.com/example/unused',
+        'owner': REPO['owner'],
+    }]
+    owned_vm = vm('gcp-runner-provisioning', minutes=1)
+    svc, github, gcloud, _ = service(vms=[owned_vm])
+    svc.cache = cache
+    github.list_installation_repositories.return_value = repos
+
+    assert svc.run()['scanned_repos'] == 1
+    github.list_queued_workflow_jobs.assert_called_once_with('example/project', 'mock-token')
+    gcloud.delete_runner_instance.assert_not_called()

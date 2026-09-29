@@ -7,6 +7,23 @@ from app.services.webhook_service import WebhookService
 class TestWebhookService:
     @patch('app.services.webhook_service.GCloudClient')
     @patch('app.services.webhook_service.GitHubClient')
+    def test_reconciler_job_id_is_forwarded_to_gce(self, mock_gh_class, mock_gc_class):
+        mock_gh_class.return_value.get_registration_token.return_value = 'fake-token'
+        service = WebhookService()
+
+        service._handle_queued_job(
+            'gcp-bench-8core', 'https://github.com/example/project',
+            'https://github.com/example', 'example/project', 'example',
+            delivery_id='reconcile', job_id='123456',
+        )
+
+        mock_gc_class.return_value.create_runner_instance.assert_called_once_with(
+            'fake-token', 'https://github.com/example', 'gcp-bench-8core',
+            'example/project', delivery_id='reconcile', job_id='123456',
+        )
+
+    @patch('app.services.webhook_service.GCloudClient')
+    @patch('app.services.webhook_service.GitHubClient')
     def test_handle_queued_job_with_matching_label(self, mock_gh_client_class, mock_gc_client_class):
         """Test handling queued job with matching label."""
         mock_gh_client = Mock()

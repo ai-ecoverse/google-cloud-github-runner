@@ -27,6 +27,33 @@ def mock_gcloud_auth():
 
 
 class TestGCloudClient:
+    def test_reconciler_job_id_becomes_gce_safe_label(self, mock_env_vars, mock_compute_clients, mock_gcloud_auth):
+        instance_client, _ = mock_compute_clients
+        client = GCloudClient()
+        template = MagicMock()
+        template.name = 'gcp-bench-8core-20260929120000'
+        template.self_link = 'projects/test-project/regions/us-central1/instanceTemplates/example'
+        client._get_template_name = MagicMock(return_value=template)
+
+        client.create_runner_instance('fake-token', 'https://github.com/example',
+                                      'gcp-bench-8core', 'example/project', job_id='12345678901')
+
+        request = instance_client.return_value.insert.call_args.kwargs['request']
+        assert request.instance_resource.labels['gha-job'] == '12345678901'
+        assert request.instance_resource.labels['gha-runner'] == 'gcp-bench-8core'
+
+    def test_reconciler_rejects_unsafe_job_id(self, mock_env_vars, mock_compute_clients, mock_gcloud_auth):
+        instance_client, _ = mock_compute_clients
+        client = GCloudClient()
+        template = MagicMock()
+        template.name = 'gcp-bench-8core-20260929120000'
+        client._get_template_name = MagicMock(return_value=template)
+
+        with pytest.raises(ValueError, match='GCE-safe'):
+            client.create_runner_instance('fake-token', 'https://github.com/example',
+                                          'gcp-bench-8core', 'example/project', job_id='123/456')
+        instance_client.return_value.insert.assert_not_called()
+
     def test_idle_marker_preserves_other_vm_labels(self, mock_env_vars, mock_compute_clients, mock_gcloud_auth):
         instance_client, _ = mock_compute_clients
         client = GCloudClient()

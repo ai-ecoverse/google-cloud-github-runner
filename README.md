@@ -217,7 +217,7 @@ The endpoint verifies the token audience and service account email. The public w
 remains authenticated by its GitHub HMAC signature and is exempt from the shared proxy
 rate limit.
 
-Each tick checks every repository in the GitHub App installation. For each `gcp-*` label,
+Full scans check every repository in the GitHub App installation. For each `gcp-*` label,
 queued jobs older than two minutes are demand; provisioning or online idle VMs are supply.
 Busy VMs are excluded. Missing capacity uses the same instance insertion path as the
 webhook. Quota or zone stockout stops further inserts until the next tick. The reaper
@@ -225,6 +225,17 @@ deletes VMs that never registered after 15 minutes or have been observed online 
 idle for 20 minutes; it checks GitHub again immediately before deletion and never
 deletes a runner reported busy. A structured `reconcile` log entry records demand,
 supply, creations, and deletions for each label and scope.
+
+To keep two-minute ticks short, each Cloud Run process scans repositories with a runner
+VM or a recently observed `gcp-*` job, and scans the full installation every 30 minutes.
+A newly installed repository with a lost first webhook can therefore wait up to one full
+scan interval. Reconciler-created VMs carry a numeric `gha-job` label; for five minutes,
+that VM covers its job even if GitHub's jobs API still reports `queued` after assignment.
+
+GitHub's workflow jobs API does not identify matrix jobs held by `strategy.max-parallel`:
+they also appear as `queued`. The reconciler can provision these early, and the idle
+reaper later retires unused VMs. For benchmark workflows, set `shards ≤ max-parallel`
+to avoid this idle capacity cycle.
 
 ## 🔐 Environment Variables
 
@@ -246,6 +257,9 @@ supply, creations, and deletions for each label and scope.
 | `RECONCILE_JOB_GRACE_SECONDS` | Queued job grace period | No (default: `120`) |
 | `RECONCILE_IDLE_SECONDS` | Online idle reaping threshold | No (default: `1200`) |
 | `RECONCILE_REGISTRATION_SECONDS` | Never-registered VM threshold | No (default: `900`) |
+| `RECONCILE_ASSIGNMENT_GRACE_SECONDS` | Recent job-to-VM assignment window | No (default: `300`) |
+| `RECONCILE_FULL_SCAN_SECONDS` | Full installation scan interval | No (default: `1800`) |
+| `RECONCILE_HOT_REPO_SECONDS` | Recently active repository cache lifetime | No (default: `21600`) |
 
 *\*One of `GITHUB_PRIVATE_KEY` or `GITHUB_PRIVATE_KEY_PATH` must be set.*
 
