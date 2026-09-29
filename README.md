@@ -209,6 +209,23 @@ graph TD
 5.  **Webhook: Job Completed**: Instance deregisters with GitHub and is deleted.
 6.  **Delete Runner Instance (VM)**: App deletes the GCE instance upon `workflow_job.completed`.
 
+### Queued job reconciliation
+
+A paused Cloud Scheduler job is provisioned with the manager. When enabled, it posts to
+`/reconcile` every two minutes using a dedicated service account's Google OIDC token.
+The endpoint verifies the token audience and service account email. The public webhook
+remains authenticated by its GitHub HMAC signature and is exempt from the shared proxy
+rate limit.
+
+Each tick checks every repository in the GitHub App installation. For each `gcp-*` label,
+queued jobs older than two minutes are demand; provisioning or online idle VMs are supply.
+Busy VMs are excluded. Missing capacity uses the same instance insertion path as the
+webhook. Quota or zone stockout stops further inserts until the next tick. The reaper
+deletes VMs that never registered after 15 minutes or have been observed online and
+idle for 20 minutes; it checks GitHub again immediately before deletion and never
+deletes a runner reported busy. A structured `reconcile` log entry records demand,
+supply, creations, and deletions for each label and scope.
+
 ## 🔐 Environment Variables
 
 | Variable                  | Description                    | Required                                   |
@@ -224,6 +241,11 @@ graph TD
 | `PORT`                    | Web server port                | No (default: `8080`)                       |
 | `SETUP_USERNAME`          | Setup authentication username  | No (default: `cloud`)                      |
 | `SETUP_PASSWORD`          | Setup authentication password  | No (default: `GOOGLE_CLOUD_PROJECT`)       |
+| `RECONCILE_AUDIENCE`      | Cloud Run service URL used as the OIDC audience | Yes for `/reconcile` |
+| `RECONCILE_SERVICE_ACCOUNT` | Scheduler service account email | Yes for `/reconcile` |
+| `RECONCILE_JOB_GRACE_SECONDS` | Queued job grace period | No (default: `120`) |
+| `RECONCILE_IDLE_SECONDS` | Online idle reaping threshold | No (default: `1200`) |
+| `RECONCILE_REGISTRATION_SECONDS` | Never-registered VM threshold | No (default: `900`) |
 
 *\*One of `GITHUB_PRIVATE_KEY` or `GITHUB_PRIVATE_KEY_PATH` must be set.*
 
@@ -234,6 +256,7 @@ graph TD
 *   `GET /setup/complete` - Post-installation handler (requires HTTP Basic Auth)
 *   `POST /setup/trigger-restart` - Restart application (requires HTTP Basic Auth)
 *   `POST /webhook` - Main GitHub webhook receiver (requires valid GitHub webhook signature)
+*   `POST /reconcile` - Cloud Scheduler tick (requires a Google OIDC token for the configured audience and service account)
 
 ## 💻 Local Development
 

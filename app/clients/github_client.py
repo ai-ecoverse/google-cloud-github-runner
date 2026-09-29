@@ -6,6 +6,7 @@ import time
 import jwt
 import requests
 import logging
+from urllib.parse import quote
 
 REQUEST_TIMEOUT = 30  # seconds
 
@@ -110,3 +111,50 @@ class GitHubClient:
         response = requests.post(url, headers=headers, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         return response.json()['token']
+
+    def _list_pages(self, path, key, token, params=None):
+        """Read every page; fail closed if GitHub truncates a large result set."""
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Accept': 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28',
+        }
+        items = []
+        page = 1
+        while True:
+            query = dict(params or {}, per_page=100, page=page)
+            response = requests.get(f'https://api.github.com{path}', headers=headers,
+                                    params=query, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            body = response.json()
+            batch = body[key] if key else body
+            items.extend(batch)
+            if len(batch) < 100:
+                if body.get('total_count', len(items)) > len(items):
+                    raise RuntimeError(f'Incomplete GitHub pagination for {path}')
+                return items
+            page += 1
+
+    def list_installation_repositories(self, token):
+        return self._list_pages('/installation/repositories', 'repositories', token)
+
+    def list_queued_workflow_jobs(self, repo_name, token):
+        """Inspect jobs in every active workflow run, including runs at max-parallel."""
+        repo = quote(repo_name, safe='/')
+        jobs = {}
+        for status in ('queued', 'in_progress', 'waiting', 'pending', 'requested'):
+            runs = self._list_pages(f'/repos/{repo}/actions/runs', 'workflow_runs', token,
+                                    {'status': status})
+            for run in runs:
+                for job in self._list_pages(f"/repos/{repo}/actions/runs/{run['id']}/jobs", 'jobs', token):
+                    if job.get('status') == 'queued':
+                        jobs[job['id']] = job
+        return list(jobs.values())
+
+    def list_runners(self, scope, token):
+        kind, name = scope
+        if kind == 'org':
+            path = f'/orgs/{quote(name, safe="")}/actions/runners'
+        else:
+            path = f'/repos/{quote(name, safe="/")}/actions/runners'
+        return self._list_pages(path, 'runners', token)

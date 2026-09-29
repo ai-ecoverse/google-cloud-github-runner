@@ -105,7 +105,7 @@ def handle_workflow_job_event(payload, delivery_id=None):
     except Exception as e:
         logger.error(
             "[Webhook] Error handling webhook: %s, delivery_id: %s",
-            str(e),
+            type(e).__name__,
             delivery_id,
         )
         return jsonify({'status': 'error', 'message': 'Internal error'}), 500

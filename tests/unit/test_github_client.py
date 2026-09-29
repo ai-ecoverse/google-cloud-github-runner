@@ -34,6 +34,33 @@ class TestGitHubClient:
         assert client.installation_id == '67890'
         assert client.private_key_path == 'test-key.pem'
 
+    @patch('app.clients.github_client.requests.get')
+    def test_list_installation_repositories_paginates(self, mock_get, mock_env_vars):
+        first = MagicMock()
+        first.json.return_value = {'total_count': 101, 'repositories': [{'id': n} for n in range(100)]}
+        second = MagicMock()
+        second.json.return_value = {'total_count': 101, 'repositories': [{'id': 100}]}
+        mock_get.side_effect = [first, second]
+
+        repos = GitHubClient().list_installation_repositories('mock-token')
+
+        assert len(repos) == 101
+        assert mock_get.call_args_list[0].kwargs['params']['page'] == 1
+        assert mock_get.call_args_list[1].kwargs['params']['page'] == 2
+
+    @patch.object(GitHubClient, '_list_pages')
+    def test_list_queued_workflow_jobs_deduplicates_active_runs(self, mock_pages, mock_env_vars):
+        queued = {'id': 42, 'status': 'queued'}
+        running = {'id': 43, 'status': 'in_progress'}
+
+        def pages(path, key, token, params=None):
+            if key == 'workflow_runs':
+                return [{'id': 123}] if params['status'] in ('queued', 'in_progress') else []
+            return [queued, running]
+
+        mock_pages.side_effect = pages
+        assert GitHubClient().list_queued_workflow_jobs('owner/repo', 'mock-token') == [queued]
+
     def test_init_missing_config(self):
         """Test GitHubClient initialization with missing configuration."""
         with patch.dict('os.environ', {}, clear=True):

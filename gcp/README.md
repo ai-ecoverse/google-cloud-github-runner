@@ -253,6 +253,37 @@ terraform apply
 
 The used [Dockerfile](../Dockerfile) is located in the upper directory.
 
+## Runner reconciliation rollout and rollback
+
+Terraform provisions `github-runners-scheduler` with `roles/run.invoker` and a
+`github-runners-reconcile` Cloud Scheduler job in **paused** state. The job targets
+the manager's stable project-number Cloud Run URL and sends a matching OIDC audience.
+The manager also validates the scheduler account email inside `/reconcile`, since the
+service accepts public GitHub webhooks. The GitHub App needs Actions read, repository
+Administration read, and organization Self-hosted runners read; the generated App
+manifest already grants stronger permissions for the latter two. Keep the job paused
+until the new revision serves traffic.
+
+For the `ai-ecoverse-493315` manager, stage a candidate image with
+`gcloud run deploy github-runners-manager-uc1 --image IMAGE --region us-central1 --project ai-ecoverse-493315 --no-traffic --tag reconcile`. Confirm that traffic
+still points to `github-runners-manager-uc1-00004-x9b`, then enable the scheduler
+job only after switching traffic and checking a queued-job starvation test. The
+previous image is `app@sha256:2d4c1b05da5f4067ab0ae0bddcbe4a85522de2851d99af41eb8746daccec73de`.
+To roll back, pause `github-runners-reconcile` first, then send 100% traffic to
+revision `github-runners-manager-uc1-00004-x9b`:
+
+```bash
+gcloud scheduler jobs pause github-runners-reconcile --location us-central1 --project ai-ecoverse-493315
+gcloud run services update-traffic github-runners-manager-uc1 \
+  --to-revisions github-runners-manager-uc1-00004-x9b=100 \
+  --region us-central1 --project ai-ecoverse-493315
+```
+
+If the scheduler account, IAM binding, and job were initially created with
+`gcloud` rather than Terraform, import those resources into the existing
+Terraform state before applying this configuration. Keep `paused = true` until
+the traffic switch and live test are complete.
+
 ## Rebuild Google Compute Engine Custom Images
 
 To rebuild the Google Compute Engine custom images, run:

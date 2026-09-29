@@ -27,6 +27,22 @@ def mock_gcloud_auth():
 
 
 class TestGCloudClient:
+    def test_idle_marker_preserves_other_vm_labels(self, mock_env_vars, mock_compute_clients, mock_gcloud_auth):
+        instance_client, _ = mock_compute_clients
+        client = GCloudClient()
+        vm = MagicMock()
+        vm.name = 'gcp-runner-abc'
+        vm.labels = {'gha-runner': 'gcp-bench-8core'}
+        vm.label_fingerprint = 'fingerprint'
+
+        client.set_runner_idle_since(vm, 123456)
+
+        request = instance_client.return_value.set_labels.call_args.kwargs
+        assert request['instance'] == vm.name
+        assert dict(request['instances_set_labels_request_resource'].labels) == {
+            'gha-runner': 'gcp-bench-8core', 'gha-idle-since': '123456',
+        }
+
     def test_init_with_env_vars(self, mock_env_vars, mock_compute_clients, mock_gcloud_auth):
         """Test GCloudClient initialization with environment variables."""
         client = GCloudClient()

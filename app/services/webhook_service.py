@@ -153,7 +153,7 @@ class WebhookService:
 
         except Exception as e:
             logger.error(
-                "Failed to spawn runner: %s, delivery_id: %s", str(e), delivery_id
+                "Failed to spawn runner: %s, delivery_id: %s", type(e).__name__, delivery_id
             )
             raise
 

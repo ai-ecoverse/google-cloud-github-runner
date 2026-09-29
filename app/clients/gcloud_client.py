@@ -166,7 +166,7 @@ class GCloudClient:
             return instance_name
         except Exception as e:
             logger.error(
-                "Failed to create instance: %s, delivery_id: %s", e, delivery_id
+                "Failed to create instance: %s, delivery_id: %s", type(e).__name__, delivery_id
             )
             raise
 
@@ -200,3 +200,22 @@ class GCloudClient:
                 delivery_id,
             )
             raise
+
+    def list_runner_instances(self):
+        """Return manager-owned VMs in this zone, including provisioning VMs."""
+        return [instance for instance in self.instance_client.list(project=self.project_id, zone=self.zone)
+                if instance.name.startswith('gcp-runner-')]
+
+    def set_runner_idle_since(self, instance, timestamp):
+        """Persist first observed idle time across Cloud Run instances and restarts."""
+        labels = dict(instance.labels or {})
+        if timestamp is None:
+            labels.pop('gha-idle-since', None)
+        else:
+            labels['gha-idle-since'] = str(timestamp)
+        self.instance_client.set_labels(
+            project=self.project_id, zone=self.zone, instance=instance.name,
+            instances_set_labels_request_resource=compute_v1.InstancesSetLabelsRequest(
+                labels=labels, label_fingerprint=instance.label_fingerprint,
+            ),
+        )
