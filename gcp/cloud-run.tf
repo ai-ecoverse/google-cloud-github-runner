@@ -29,11 +29,12 @@ module "cloud_run_github_runners_manager" {
         startup_cpu_boost = false # We do not scale to zero.
       }
       env = {
-        GOOGLE_CLOUD_PROJECT      = var.project_id
-        GOOGLE_CLOUD_ZONE         = "${var.region}-${var.zone}"
-        GITHUB_RUNNER_GROUP       = var.github_runner_group
-        RECONCILE_AUDIENCE        = local.reconcile_service_url
-        RECONCILE_SERVICE_ACCOUNT = google_service_account.runner_reconciler.email
+        GOOGLE_CLOUD_PROJECT        = var.project_id
+        GOOGLE_CLOUD_ZONE           = "${var.region}-${var.zone}"
+        GOOGLE_CLOUD_FALLBACK_ZONES = var.region == "us-central1" ? "us-central1-a,us-central1-c,us-central1-f" : ""
+        GITHUB_RUNNER_GROUP         = var.github_runner_group
+        RECONCILE_AUDIENCE          = local.reconcile_service_url
+        RECONCILE_SERVICE_ACCOUNT   = google_service_account.runner_reconciler.email
       }
       env_from_key = {
         GITHUB_APP_ID = {

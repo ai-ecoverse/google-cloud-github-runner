@@ -270,6 +270,10 @@ Confirm that the traffic allocation and Scheduler state are unchanged by staging
 For an initial rollout, enable the scheduler only after switching traffic and checking
 a queued-job starvation test. The
 previous image is `app@sha256:2d4c1b05da5f4067ab0ae0bddcbe4a85522de2851d99af41eb8746daccec73de`.
+Zone fallback creates VMs outside the original `us-central1-b` zone. Older manager
+revisions only inventory and delete VMs in their configured primary zone. Before
+rolling back to one of them, let fallback VMs finish and be cleaned up by the
+zone-aware revision, or arrange safe cleanup after verifying no runner is busy.
 To roll back, pause `github-runners-reconcile` first, then send 100% traffic to
 revision `github-runners-manager-uc1-00004-x9b`:
 

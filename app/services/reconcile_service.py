@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from threading import Lock
 
 from app.clients import GCloudClient, GitHubClient
+from app.clients.gcloud_client import insert_error_reason
 from app.services.webhook_service import WebhookService
 
 
@@ -15,11 +16,7 @@ def parse_time(value):
 
 
 def is_capacity_error(error):
-    message = str(error).upper()
-    return any(marker in message for marker in (
-        'QUOTA_EXCEEDED', 'RESOURCE_POOL_EXHAUSTED', 'STOCKOUT',
-        'DOES NOT HAVE ENOUGH RESOURCES', 'ZONE_RESOURCE_POOL',
-    ))
+    return insert_error_reason(error) in ('quota', 'stockout', 'timeout')
 
 
 def scope_for_repo(repo):
@@ -31,7 +28,23 @@ def scope_for_repo(repo):
 
 def label_entry(summary, scope, label):
     key = f'{scope[0]}:{scope[1]}/{label}'
-    return summary['labels'].setdefault(key, {'demand': 0, 'supply': 0, 'created': 0, 'deleted': 0})
+    return summary['labels'].setdefault(key, {
+        'demand': 0, 'supply': 0, 'attempted': 0, 'created': 0, 'deleted': 0, 'errors': {},
+    })
+
+
+def log_tick(summary):
+    summary['demand'] = sum(entry['demand'] for entry in summary['labels'].values())
+    summary['supply'] = sum(entry['supply'] for entry in summary['labels'].values())
+    summary['deleted'] = sum(entry['deleted'] for entry in summary['labels'].values())
+    print(json.dumps({'severity': 'INFO', **summary}, sort_keys=True), flush=True)
+
+
+class StockoutBackoff:
+    """Use one probe on the next tick after all configured zones stock out."""
+
+    def __init__(self):
+        self.active = False
 
 
 class RepoScanCache:
@@ -67,17 +80,19 @@ class RepoScanCache:
 
 repo_scan_cache = RepoScanCache()
 reconcile_lock = Lock()
+stockout_backoff = StockoutBackoff()
 
 
 class ReconcileService:
     """Top up missing capacity and retire runners that are safely idle."""
 
-    def __init__(self, github=None, gcloud=None, webhook=None, now=None, cache=None):
+    def __init__(self, github=None, gcloud=None, webhook=None, now=None, cache=None, backoff=None):
         self.github = github or GitHubClient()
         self.gcloud = gcloud or GCloudClient()
         self.webhook = webhook or WebhookService()
         self.now = now or datetime.now(timezone.utc)
         self.cache = cache if cache is not None else repo_scan_cache
+        self.backoff = backoff if backoff is not None else stockout_backoff
         self.job_grace = int(os.environ.get('RECONCILE_JOB_GRACE_SECONDS', '120'))
         self.idle_limit = int(os.environ.get('RECONCILE_IDLE_SECONDS', '1200'))
         self.registration_limit = int(os.environ.get('RECONCILE_REGISTRATION_SECONDS', '900'))
@@ -153,10 +168,11 @@ class ReconcileService:
 
     def run(self):
         started = time.monotonic()
-        summary = {'event': 'reconcile', 'labels': {}, 'capacity_stop': False, 'timing_ms': {}}
+        summary = {'event': 'reconcile', 'labels': {}, 'capacity_stop': False, 'timing_ms': {},
+                   'attempted': 0, 'created': 0, 'errors': {}, 'stockout_probe': self.backoff.active}
         if not reconcile_lock.acquire(blocking=False):
             summary['skipped'] = 'already_running'
-            print(json.dumps(summary, sort_keys=True), flush=True)
+            log_tick(summary)
             return summary
         try:
             phase = time.monotonic()
@@ -200,6 +216,7 @@ class ReconcileService:
             for key, count in supply.items():
                 scope, label = key
                 summary['labels'][f'{scope[0]}:{scope[1]}/{label}']['supply'] = count
+            probe_remaining = 1 if self.backoff.active else None
             for key, jobs in sorted(demand.items()):
                 scope, label = key
                 entry = label_entry(summary, scope, label)
@@ -212,7 +229,14 @@ class ReconcileService:
                 if len(remaining) != len(jobs):
                     entry['recent_assignments'] = len(jobs) - len(remaining)
                 for _, repo, job_id in sorted(remaining, key=lambda item: item[0])[available:]:
+                    if probe_remaining == 0:
+                        summary['capacity_stop'] = True
+                        return summary
                     owner = repo['owner']
+                    entry['attempted'] += 1
+                    summary['attempted'] += 1
+                    if probe_remaining is not None:
+                        probe_remaining -= 1
                     try:
                         name = self.webhook._handle_queued_job(
                             label, repo['html_url'], owner['html_url'], repo['full_name'],
@@ -221,14 +245,24 @@ class ReconcileService:
                             job_id=job_id,
                         )
                     except Exception as error:
+                        reason = insert_error_reason(error)
+                        entry['errors'][reason] = entry['errors'].get(reason, 0) + 1
+                        summary['errors'][reason] = summary['errors'].get(reason, 0) + 1
+                        if reason == 'stockout':
+                            self.backoff.active = True
                         if is_capacity_error(error):
                             summary['capacity_stop'] = True
                             return summary
                         raise
                     if not name:
                         entry['unsupported_template'] = True
+                        entry['errors']['unsupported_template'] = entry['errors'].get('unsupported_template', 0) + 1
+                        summary['errors']['unsupported_template'] = summary['errors'].get('unsupported_template', 0) + 1
                         break
+                    self.backoff.active = False
+                    probe_remaining = None
                     entry['created'] += 1
+                    summary['created'] += 1
             return summary
         except Exception as error:
             summary['error'] = type(error).__name__
@@ -240,4 +274,4 @@ class ReconcileService:
         finally:
             summary['timing_ms']['total'] = round((time.monotonic() - started) * 1000)
             reconcile_lock.release()
-            print(json.dumps(summary, sort_keys=True), flush=True)
+            log_tick(summary)

@@ -220,11 +220,19 @@ rate limit.
 Full scans check every repository in the GitHub App installation. For each `gcp-*` label,
 queued jobs older than two minutes are demand; provisioning or online idle VMs are supply.
 Busy VMs are excluded. Missing capacity uses the same instance insertion path as the
-webhook. Quota or zone stockout stops further inserts until the next tick. The reaper
+webhook. Webhooks keep their fast primary-zone dispatch. For reconciler inserts, the
+manager waits for the GCE operation to finish: a started operation is not counted as
+a created VM. On a zone stockout, it tries the other configured zones with the same
+regional template. Quota errors stop immediately. After all zones
+stock out, the next tick tries one probe; if it succeeds, that tick fills the remaining
+demand. This probe state is local to each Cloud Run process. The reaper
 deletes VMs that never registered after 15 minutes or have been observed online and
 idle for 20 minutes; it checks GitHub again immediately before deletion and never
-deletes a runner reported busy. A structured `reconcile` log entry records demand,
-supply, creations, and deletions for each label and scope.
+deletes a runner reported busy. One structured INFO `reconcile` log entry records
+demand, supply, attempted jobs, creations, deletions, and errors by reason for each
+label and scope. Fallback VM names encode their zone so completion webhooks and the
+idle reaper delete them in the correct zone; inventory covers all four us-central1
+zones, including older VMs in the original zone.
 
 To keep two-minute ticks short, each Cloud Run process scans repositories with a runner
 VM or a recently observed `gcp-*` job, and scans the full installation every 30 minutes.
@@ -259,6 +267,7 @@ does not coordinate separate Cloud Run instances.
 | `GITHUB_WEBHOOK_SECRET`   | Webhook signature secret       | Yes                                        |
 | `GOOGLE_CLOUD_PROJECT`    | Google Cloud Project ID        | Yes                                        |
 | `GOOGLE_CLOUD_ZONE`       | Default GCP zone for runners   | No (default: `us-central1-a`)              |
+| `GOOGLE_CLOUD_FALLBACK_ZONES` | Comma-separated zones to try after a stockout | No (`a,c,f` in us-central1 when primary is `b`) |
 | `PORT`                    | Web server port                | No (default: `8080`)                       |
 | `SETUP_USERNAME`          | Setup authentication username  | No (default: `cloud`)                      |
 | `SETUP_PASSWORD`          | Setup authentication password  | No (default: `GOOGLE_CLOUD_PROJECT`)       |

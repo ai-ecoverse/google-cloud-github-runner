@@ -7,7 +7,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.clients.github_client import GitHubReadError
-from app.services.reconcile_service import ReconcileService, RepoScanCache, reconcile_lock
+from app.clients.gcloud_client import RunnerInsertError
+from app.services.reconcile_service import ReconcileService, RepoScanCache, StockoutBackoff, reconcile_lock
 
 NOW = datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
 REPO = {
@@ -43,7 +44,7 @@ def service(jobs=(), vms=(), runners=()):
     webhook = MagicMock()
     webhook._handle_queued_job.return_value = 'gcp-runner-new'
     return ReconcileService(github=github, gcloud=gcloud, webhook=webhook,
-                            now=NOW, cache=RepoScanCache()), github, gcloud, webhook
+                            now=NOW, cache=RepoScanCache(), backoff=StockoutBackoff()), github, gcloud, webhook
 
 
 def test_demand_supply_and_grace_period():
@@ -54,7 +55,7 @@ def test_demand_supply_and_grace_period():
         runners=[{'name': busy.name, 'status': 'online', 'busy': True}],
     )
     result = svc.run()['labels']['org:example/gcp-bench-8core']
-    assert result == {'demand': 2, 'supply': 1, 'created': 1, 'deleted': 0}
+    assert result == {'demand': 2, 'supply': 1, 'attempted': 1, 'created': 1, 'deleted': 0, 'errors': {}}
     webhook._handle_queued_job.assert_called_once()
     gcloud.delete_runner_instance.assert_not_called()
 
@@ -240,3 +241,33 @@ def test_failed_warm_scan_logs_safe_github_context_and_releases_lock(capsys):
     assert 'github_jobs' in result['timing_ms']
     assert 'secret' not in str(result)
     assert reconcile_lock.locked() is False
+
+
+def test_stockout_burst_probes_once_then_fans_out_after_recovery(capsys):
+    svc, _, gcloud, webhook = service(jobs=[job(4, number) for number in range(1, 23)])
+    webhook._handle_queued_job.side_effect = [
+        RunnerInsertError('stockout', 'us-central1-f'),
+        RunnerInsertError('stockout', 'us-central1-f'),
+        *[f'gcp-runner-{number}' for number in range(22)],
+    ]
+
+    first = svc.run()
+    second = svc.run()
+    recovered = svc.run()
+
+    assert first['demand'] == second['demand'] == recovered['demand'] == 22
+    assert first['attempted'] == second['attempted'] == 1
+    assert first['errors'] == second['errors'] == {'stockout': 1}
+    assert first['capacity_stop'] is second['capacity_stop'] is True
+    assert second['stockout_probe'] is True
+    assert recovered['stockout_probe'] is True
+    assert recovered['attempted'] == recovered['created'] == 22
+    assert recovered['errors'] == {}
+    assert svc.backoff.active is False
+    assert webhook._handle_queued_job.call_count == 24
+    gcloud.delete_runner_instance.assert_not_called()
+
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert len(lines) == 3
+    assert all(line['severity'] == 'INFO' for line in lines)
+    assert lines[0]['labels']['org:example/gcp-bench-8core']['errors'] == {'stockout': 1}
