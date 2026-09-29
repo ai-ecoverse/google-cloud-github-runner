@@ -115,6 +115,7 @@ class WebhookService:
         repo_name,
         org_name,
         delivery_id=None,
+        job_id=None,
     ):
         """Handle queued workflow job.
 
@@ -128,20 +129,22 @@ class WebhookService:
                 token = self.github_client.get_registration_token(
                     org_name=org_name, delivery_id=delivery_id
                 )
+                kwargs = {'delivery_id': delivery_id}
+                if job_id is not None:
+                    kwargs['job_id'] = job_id
                 return self.gcloud_client.create_runner_instance(
-                    token,
-                    repo_owner_url,
-                    template_name,
-                    repo_name,
-                    delivery_id=delivery_id,
+                    token, repo_owner_url, template_name, repo_name, **kwargs,
                 )
             elif repo_name:
                 # Create GitHub Actions runner instance for repository
                 token = self.github_client.get_registration_token(
                     repo_name=repo_name, delivery_id=delivery_id
                 )
+                kwargs = {'delivery_id': delivery_id}
+                if job_id is not None:
+                    kwargs['job_id'] = job_id
                 return self.gcloud_client.create_runner_instance(
-                    token, repo_url, template_name, repo_name, delivery_id=delivery_id
+                    token, repo_url, template_name, repo_name, **kwargs
                 )
             else:
                 logger.error(
@@ -153,7 +156,7 @@ class WebhookService:
 
         except Exception as e:
             logger.error(
-                "Failed to spawn runner: %s, delivery_id: %s", str(e), delivery_id
+                "Failed to spawn runner: %s, delivery_id: %s", type(e).__name__, delivery_id
             )
             raise
 
