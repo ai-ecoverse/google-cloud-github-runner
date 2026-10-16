@@ -1,7 +1,8 @@
 import pytest
 import logging
+import requests
 from unittest.mock import patch, MagicMock
-from app.clients.github_client import GitHubClient
+from app.clients.github_client import GitHubClient, GitHubReadError
 
 
 @pytest.fixture
@@ -33,6 +34,78 @@ class TestGitHubClient:
         assert client.app_id == '12345'
         assert client.installation_id == '67890'
         assert client.private_key_path == 'test-key.pem'
+
+    @patch('app.clients.github_client.requests.get')
+    def test_list_installation_repositories_paginates(self, mock_get, mock_env_vars):
+        first = MagicMock()
+        first.json.return_value = {'total_count': 101, 'repositories': [{'id': n} for n in range(100)]}
+        second = MagicMock()
+        second.json.return_value = {'total_count': 101, 'repositories': [{'id': 100}]}
+        mock_get.side_effect = [first, second]
+
+        repos = GitHubClient().list_installation_repositories('mock-token')
+
+        assert len(repos) == 101
+        assert mock_get.call_args_list[0].kwargs['params']['page'] == 1
+        assert mock_get.call_args_list[1].kwargs['params']['page'] == 2
+
+    @patch('app.clients.github_client.time.sleep')
+    @patch('app.clients.github_client.requests.get')
+    def test_pagination_retries_when_total_changes_mid_read(self, mock_get, mock_sleep, mock_env_vars):
+        inconsistent = MagicMock(status_code=200)
+        inconsistent.json.return_value = {'total_count': 2, 'repositories': [{'id': 1}]}
+        stable = MagicMock(status_code=200)
+        stable.json.return_value = {'total_count': 1, 'repositories': [{'id': 1}]}
+        mock_get.side_effect = [inconsistent, stable]
+
+        assert GitHubClient().list_installation_repositories('secret-token') == [{'id': 1}]
+        assert mock_get.call_count == 2
+        mock_sleep.assert_called_once()
+
+    @patch('app.clients.github_client.time.sleep')
+    @patch('app.clients.github_client.requests.get')
+    def test_persistent_incomplete_pagination_fails_with_safe_context(self, mock_get, mock_sleep, mock_env_vars):
+        incomplete = MagicMock(status_code=200)
+        incomplete.json.return_value = {'total_count': 2, 'repositories': [{'id': 1}]}
+        mock_get.return_value = incomplete
+
+        with pytest.raises(GitHubReadError) as raised:
+            GitHubClient().list_installation_repositories('secret-token')
+
+        assert raised.value.status_code == 200
+        assert raised.value.endpoint_path == '/installation/repositories'
+        assert raised.value.reason == 'incomplete_pagination'
+        assert 'secret-token' not in str(raised.value)
+        assert mock_get.call_count == 3
+        assert mock_sleep.call_count == 2
+
+    @patch('app.clients.github_client.requests.get')
+    def test_http_failure_keeps_status_and_path_without_response_text(self, mock_get, mock_env_vars):
+        response = MagicMock(status_code=503)
+        response.raise_for_status.side_effect = requests.HTTPError(
+            'secret response text', response=response,
+        )
+        mock_get.return_value = response
+
+        with pytest.raises(GitHubReadError) as raised:
+            GitHubClient().list_installation_repositories('secret-token')
+
+        assert raised.value.status_code == 503
+        assert raised.value.endpoint_path == '/installation/repositories'
+        assert 'secret' not in str(raised.value)
+
+    @patch.object(GitHubClient, '_list_pages')
+    def test_list_queued_workflow_jobs_deduplicates_active_runs(self, mock_pages, mock_env_vars):
+        queued = {'id': 42, 'status': 'queued'}
+        running = {'id': 43, 'status': 'in_progress'}
+
+        def pages(path, key, token, params=None):
+            if key == 'workflow_runs':
+                return [{'id': 123}] if params['status'] in ('queued', 'in_progress') else []
+            return [queued, running]
+
+        mock_pages.side_effect = pages
+        assert GitHubClient().list_queued_workflow_jobs('owner/repo', 'mock-token') == [queued]
 
     def test_init_missing_config(self):
         """Test GitHubClient initialization with missing configuration."""
